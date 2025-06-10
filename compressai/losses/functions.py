@@ -11,13 +11,18 @@ import numpy as np
 
 
 def upsample(img, odd, filt):
+    # Ensure filter is on the same device and has the same type as input
+    if img.device != filt.device:
+        filt = filt.to(img.device)
+    filt = filt.type_as(img)
+    
     img = F.pad(img, (1, 1, 1, 1), mode='replicate')
     h = 2 * img.shape[2]
     w = 2 * img.shape[3]
-    if img.is_cuda:
-        o = torch.zeros([img.shape[0], img.shape[1], h, w], device=img.get_device())
-    else:
-        o = torch.zeros([img.shape[0], img.shape[1], h, w])
+    
+    # Create zeros tensor on the same device as input
+    o = torch.zeros([img.shape[0], img.shape[1], h, w], 
+                    device=img.device, dtype=img.dtype)
     o[:, :, 0:h:2, 0:w:2] = 4 * img
     o = F.conv2d(o, filt, padding=math.floor(filt.shape[2] / 2))
     o = o[:, :, 2:h - 2 - odd[0], 2:w - 2 - odd[1]]
@@ -26,8 +31,12 @@ def upsample(img, odd, filt):
 
 
 def downsample(img, filt):
+    # Ensure filter is on the same device and has the same type as input
+    if img.device != filt.device:
+        filt = filt.to(img.device)
+    filt = filt.type_as(img)
+    
     pad = math.floor(filt.shape[2]/2)
-    # print(img.shape)
     img = F.pad(img, (pad, pad, pad, pad), mode='replicate')
     o = F.conv2d(img, filt)
     o = o[:, :, :img.shape[2]:2, :img.shape[3]:2]
@@ -36,6 +45,11 @@ def downsample(img, filt):
 
 
 def laplacian_pyramid_s(img, n_lev, filt):
+    # Ensure filter is on the same device and has the same type as input
+    if img.device != filt.device:
+        filt = filt.to(img.device)
+    filt = filt.type_as(img)
+    
     pyr = [0] * n_lev  # [0, 0, 0, ...]
     o = img
 
@@ -52,25 +66,37 @@ def laplacian_pyramid_s(img, n_lev, filt):
 
 
 def nlp(img, n_lev, params):  # 求得原图的拉普拉斯金字塔
-        npyr = [0] * n_lev
-        img = torch.pow(img, 1 / params['gamma'])
-        # img = torch.log(img)
-        # img = (1e3/math.pi)*torch.atan(img)
-        pyr = laplacian_pyramid_s(img, n_lev, params['F1'])
+    npyr = [0] * n_lev
+    img = torch.pow(img, 1 / params['gamma'])
+    # img = torch.log(img)
+    # img = (1e3/math.pi)*torch.atan(img)
+    pyr = laplacian_pyramid_s(img, n_lev, params['F1'])
 
-        for i in range(0, n_lev-1):
-            pad = math.floor(params['filts'][0].shape[2] / 2)
-            apyr = F.pad(torch.abs(pyr[i]), (pad, pad, pad, pad), mode='replicate')
-            den = F.conv2d(apyr, params['filts'][0]) + params['sigmas'][0]
-            npyr[i] = pyr[i] / den
+    for i in range(0, n_lev-1):
+        # Ensure filter is on the same device and has the same type as input
+        filt = params['filts'][0]
+        if img.device != filt.device:
+            filt = filt.to(img.device)
+        filt = filt.type_as(img)
+        
+        pad = math.floor(filt.shape[2] / 2)
+        apyr = F.pad(torch.abs(pyr[i]), (pad, pad, pad, pad), mode='replicate')
+        den = F.conv2d(apyr, filt) + params['sigmas'][0].to(img.device).type_as(img)
+        npyr[i] = pyr[i] / den
 
-        pad = math.floor(params['filts'][1].shape[2] / 2)
-        apyr = F.pad(torch.abs(pyr[n_lev-1]), (pad, pad, pad, pad), mode='replicate')
-        den = F.conv2d(apyr, params['filts'][1]) + params['sigmas'][1]
+    # Ensure filter is on the same device and has the same type as input
+    filt = params['filts'][1]
+    if img.device != filt.device:
+        filt = filt.to(img.device)
+    filt = filt.type_as(img)
+    
+    pad = math.floor(filt.shape[2] / 2)
+    apyr = F.pad(torch.abs(pyr[n_lev-1]), (pad, pad, pad, pad), mode='replicate')
+    den = F.conv2d(apyr, filt) + params['sigmas'][1].to(img.device).type_as(img)
 
-        npyr[n_lev-1] = pyr[n_lev-1] / den
+    npyr[n_lev-1] = pyr[n_lev-1] / den
 
-        return npyr
+    return npyr
 
 
 class NLPD_Loss(torch.nn.Module):
@@ -79,69 +105,49 @@ class NLPD_Loss(torch.nn.Module):
         self.params = dict()
         self.params['gamma'] = 2.60
         # self.params['gamma'] = 10
-        self.params['filts'] = dict()
-        self.params['filts'][0] = torch.tensor([[0.0400, 0.0400, 0.0500, 0.0400, 0.0400],
-                                                [0.0400, 0.0300, 0.0400, 0.0300, 0.0400],
-                                                [0.0500, 0.0400, 0.0500, 0.0400, 0.0500],
-                                                [0.0400, 0.0300, 0.0400, 0.0300, 0.0400],
-                                                [0.0400, 0.0400, 0.0500, 0.0400, 0.0400]],
-                                                dtype=torch.float)  # torch.Size([5, 5])
-        self.params['filts'][0] = self.params['filts'][0].unsqueeze(0).unsqueeze(0)  # torch.Size([1, 1, 5, 5])
+        
+        # Initialize filters as parameters to ensure proper device management
+        self.register_buffer('filt_0', torch.tensor([[0.0400, 0.0400, 0.0500, 0.0400, 0.0400],
+                                                     [0.0400, 0.0300, 0.0400, 0.0300, 0.0400],
+                                                     [0.0500, 0.0400, 0.0500, 0.0400, 0.0500],
+                                                     [0.0400, 0.0300, 0.0400, 0.0300, 0.0400],
+                                                     [0.0400, 0.0400, 0.0500, 0.0400, 0.0400]],
+                                                     dtype=torch.float).unsqueeze(0).unsqueeze(0))
 
-        self.params['filts'][1] = torch.tensor([[0, 0, 0, 0, 0],
-                                                [0, 0, 0, 0, 0],
-                                                [0, 0, 1, 0, 0],
-                                                [0, 0, 0, 0, 0],
-                                                [0, 0, 0, 0, 0]],
-                                                dtype=torch.float) # torch.Size([5, 5])
-        self.params['filts'][1] = self.params['filts'][1].unsqueeze(0).unsqueeze(0)  # torch.Size([1, 1, 5, 5])
+        self.register_buffer('filt_1', torch.tensor([[0, 0, 0, 0, 0],
+                                                     [0, 0, 0, 0, 0],
+                                                     [0, 0, 1, 0, 0],
+                                                     [0, 0, 0, 0, 0],
+                                                     [0, 0, 0, 0, 0]],
+                                                     dtype=torch.float).unsqueeze(0).unsqueeze(0))
 
-        self.params['sigmas'] = torch.tensor([0.1700, 4.8600], dtype=torch.float)  # torch.Size([2])
-        # self.params['sigmas'] = torch.tensor([0.177, 20], dtype=torch.float)
+        self.register_buffer('sigmas', torch.tensor([0.1700, 4.8600], dtype=torch.float))
 
-        self.params['F1'] = torch.tensor([[0.0025, 0.0125, 0.0200, 0.0125, 0.0025],
-                                          [0.0125, 0.0625, 0.1000, 0.0625, 0.0125],
-                                          [0.0200, 0.1000, 0.1600, 0.1000, 0.0200],
-                                          [0.0125, 0.0625, 0.1000, 0.0625, 0.0125],
-                                          [0.0025, 0.0125, 0.0200, 0.0125, 0.0025]],
-                                          dtype=torch.float)
-        self.params['F1'] = self.params['F1'].unsqueeze(0).unsqueeze(0)  # torch.Size([1, 1, 5, 5])
+        self.register_buffer('F1', torch.tensor([[0.0025, 0.0125, 0.0200, 0.0125, 0.0025],
+                                                 [0.0125, 0.0625, 0.1000, 0.0625, 0.0125],
+                                                 [0.0200, 0.1000, 0.1600, 0.1000, 0.0200],
+                                                 [0.0125, 0.0625, 0.1000, 0.0625, 0.0125],
+                                                 [0.0025, 0.0125, 0.0200, 0.0125, 0.0025]],
+                                                 dtype=torch.float).unsqueeze(0).unsqueeze(0))
 
         self.exp_s = 2.00
         self.exp_f = 0.60
 
     def forward(self, h_img, l_img, n_lev=None):
-
         ldr_min = 5.0
         ldr_max = 300.0
         cali_ldr = (ldr_max - ldr_min) * l_img + ldr_min
         l_img = cali_ldr
 
         if n_lev is None:
-            n_lev = math.floor(math.log(min(h_img.shape[2:]), 2)) - 2  # 求得金字塔的层数
-            # print('nlp_n_lev: ', n_lev)
-        filts_0 = self.params['filts'][0]
-        filts_1 = self.params['filts'][1]
-        sigmas = self.params['sigmas']
-        F1 = self.params['F1']
+            n_lev = math.floor(math.log(min(h_img.shape[2:]), 2)) - 2
 
-        if h_img.is_cuda:
-            filts_0 = filts_0.cuda(h_img.get_device())
-            filts_1 = filts_1.cuda(h_img.get_device())
-            sigmas = sigmas.cuda(h_img.get_device())
-            F1 = F1.cuda(h_img.get_device())
+        # Update params with buffers that are automatically on the correct device
+        self.params['filts'] = {0: self.filt_0, 1: self.filt_1}
+        self.params['sigmas'] = self.sigmas
+        self.params['F1'] = self.F1
 
-        filts_0 = filts_0.type_as(h_img)
-        filts_1 = filts_1.type_as(h_img)
-        sigmas = sigmas.type_as(h_img)
-        F1 = F1.type_as(h_img)
-
-        self.params['filts'][0] = filts_0
-        self.params['filts'][1] = filts_1
-        self.params['sigmas'] = sigmas
-        self.params['F1'] = F1
-
-        h_pyr = nlp(h_img, n_lev, self.params)  # default n_lev = 5
+        h_pyr = nlp(h_img, n_lev, self.params)
         l_pyr = nlp(l_img, n_lev, self.params)
 
         dis = []
@@ -190,7 +196,7 @@ class LDR_Seq(torch.nn.Module):
         f8_stops = torch.ceil((l_max - l_min) / 8)
         l_start = l_min + (l_max - l_min - f8_stops * 8) / 2
         number = 8 * 3 * f8_stops / 8
-        number = torch.tensor((number), dtype=torch.int64)
+        number = torch.tensor((number), dtype=torch.int64, device=img.device)
 
         result = []
         ek_value = []
@@ -220,7 +226,6 @@ class LDR_Seq_out(torch.nn.Module):
         #min_v = torch.min(img_q)
         #img[img < 0] = min_v
         number = len(ek_value)
-
 
         result = []
         for i in range(number):
